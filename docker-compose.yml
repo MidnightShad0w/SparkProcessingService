@@ -1,0 +1,74 @@
+# docker-compose up airflow-setup
+# ctrl+c
+# docker-compose up -d
+# docker-compose run --rm airflow-webserver airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email ds.quicksave@gmail.com
+
+# еще нужно создать connection: Admin -> Connections -> "+" ->
+# Conn Id: spark_processing_conn
+# Conn Type: HTTP
+# Host: host.docker.internal
+# Port: 8083 (5000)
+# Schema: http
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.5.1
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW_CONN_SPARK_PROCESSING_CONN: "http://:@host.docker.internal:5000"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  user: "50000:0"
+  restart: always
+
+services:
+  postgres:
+    image: postgres:14
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+
+  airflow-setup:
+    <<: *airflow-common
+    container_name: airflow-setup
+    depends_on:
+      - postgres
+    command: ["airflow", "db", "init"]
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: ["airflow", "webserver"]
+    depends_on:
+      - airflow-setup
+    ports:
+      - "8080:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: ["airflow", "scheduler"]
+    depends_on:
+      - airflow-setup
+
+  spark-processing-service:
+    build: .
+    container_name: spark-processing-service
+    ports:
+      - "5000:5000"
+    depends_on:
+      - airflow-setup
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    restart: always
