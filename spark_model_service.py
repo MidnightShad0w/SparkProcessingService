@@ -1,27 +1,30 @@
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import udf, col
-from pyspark.sql.types import DoubleType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
 import boto3
 from botocore.client import Config
 import numpy as np
+import pandas as pd
+import torch
+import os
 
 # Импортируем наши классы/функции для BERT+AutoEncoder
 from ml_model import BertEncoder, AutoEncoder, compute_reconstruction_errors
 
+
 class SparkModelService:
     def __init__(
-        self,
-        bucket_name: str,
-        minio_endpoint: str,
-        minio_access_key: str,
-        minio_secret_key: str
+            self,
+            bucket_name: str,
+            minio_endpoint: str,
+            minio_access_key: str,
+            minio_secret_key: str
     ):
         self.bucket_name = bucket_name
         self.minio_endpoint = minio_endpoint
         self.minio_access_key = minio_access_key
         self.minio_secret_key = minio_secret_key
 
-        # Инициализируем SparkSession
+        # 1) Инициализируем SparkSession
         self.spark = SparkSession.builder \
             .appName("AnomalyDetection") \
             .master("local[*]") \
@@ -30,9 +33,10 @@ class SparkModelService:
             .config("spark.hadoop.fs.s3a.secret.key", self.minio_secret_key) \
             .config("spark.hadoop.fs.s3a.path.style.access", "true") \
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+            .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.1") \
             .getOrCreate()
 
-        # Инициализация клиента MinIO (S3) через boto3
+        # 2) Инициализация клиента MinIO (S3) через boto3
         self.s3_client = boto3.client(
             's3',
             endpoint_url=self.minio_endpoint,
@@ -41,23 +45,41 @@ class SparkModelService:
             config=Config(signature_version='s3v4')
         )
 
-        # Для примера создадим объекты BERT-энкодера и загруженный автоэнкодер
-        # Предположим, что мы уже где-то обучили автоэнкодер и просто подгружаем его веса.
-        # Или же используем его напрямую без сложного сохранения, как пример.
-        self.bert_encoder = BertEncoder()
+        # 3) Загрузка обученной модели + threshold из MinIO (или локально)
+        #    Предположим, что в MinIO в папке model/ лежат автоэнкодер и threshold.
+        #    Скачаем их на локальную машину (в папку /tmp) и загрузим в память.
+        model_local_path = "/tmp/autoencoder.pt"
+        threshold_local_path = "/tmp/threshold.txt"
+
+        # Скачиваем из MinIO в локальные файлы. Если у вас S3-совместимое хранилище,
+        # то объект называется "model/autoencoder.pt", "model/threshold.txt".
+        self.s3_client.download_file(bucket_name, "model/autoencoder.pt", model_local_path)
+        self.s3_client.download_file(bucket_name, "model/threshold.txt", threshold_local_path)
+
+        # Инициализируем BERT + AutoEncoder
+        self.device = "cpu"  # или "cpu"
+        self.bert_encoder = BertEncoder(device=self.device)
+
         self.autoencoder = AutoEncoder()
-        # На практике: autoencoder.load_state_dict(torch.load("path_to_autoencoder_weights.pth"))
+        self.autoencoder.load_state_dict(torch.load(model_local_path, map_location=self.device))
+        self.autoencoder.eval()
+
+        # Загружаем threshold
+        with open(threshold_local_path, "r", encoding="utf-8") as f:
+            self.threshold = float(f.read().strip())
+
+        print(">>> AutoEncoder и threshold загружены из MinIO.")
 
     def process_file(self, csv_path: str, model_path: str, result_path: str):
         """
-        csv_path   – путь к входному CSV (s3a://bucket-spark/uploads/....csv)
-        model_path – формально путь к папке модели (для совместимости с Java-кодом),
-                     но здесь мы модель берём напрямую в коде.
-        result_path – путь, куда сохранить parquet с аномалиями (s3a://bucket-spark/result-anomaly-logs).
+        csv_path   – путь к входному CSV (например, s3a://bucket-spark/uploads/something.csv)
+        model_path – формально путь к папке модели (для совместимости),
+                     но фактически мы модель уже загрузили в __init__.
+        result_path – куда сохранить parquet с аномалиями (s3a://bucket-spark/result-anomaly-logs).
         """
         print("Путь к входному файлу:", csv_path)
 
-        # 1) Читаем CSV
+        # 1) Читаем CSV.
         try:
             input_df = self.spark.read \
                 .option("header", "true") \
@@ -70,57 +92,60 @@ class SparkModelService:
             else:
                 raise e
 
+        # Если ваш CSV имеет лишнюю колонку _c0, можно её дропнуть:
+        if "_c0" in input_df.columns:
+            input_df = input_df.drop("_c0")
+
         input_df.printSchema()
 
-        # Предположим, что логи лежат в поле "log_text" (проверьте реальное имя колонки!)
-        # Соберём все тексты в локальный список (с осторожностью, если очень большой датасет!)
-        # Для демонстрации берём .collect() – на больших данных нужен другой подход.
-        log_rows = input_df.select("log_text").rdd.map(lambda row: row[0]).collect()
-        # Некоторые поля могут быть None. Отфильтруем:
-        log_rows = [text for text in log_rows if text is not None]
+        # 2) Собираем тексты. (Это дорого при больших объёмах!)
+        rows = input_df.select("Message").na.drop().collect()
+        messages = [r["Message"] for r in rows]
 
-        # 2) Считаем ошибки реконструкции для каждого лога
+        if not messages:
+            print("Нет текстов для обработки (колонка Message пуста?).")
+            return
+
+        # 3) Считаем reconstruction error для каждого сообщения
         errors = compute_reconstruction_errors(
-            texts=log_rows,
+            texts=messages,
             bert_encoder=self.bert_encoder,
-            autoencoder=self.autoencoder,
-            device="cpu"
+            autoencoder=self.autoencoder
         )
 
-        # 3) Определяем порог аномалии, например, 90-й перцентиль
-        threshold = float(np.percentile(errors, 90))
-        print("Anomaly threshold (90th percentile):", threshold)
+        # Не нужен percentil, т.к. у нас уже есть self.threshold,
+        # которую мы загрузили из обучающей стадии.
+        threshold = self.threshold
+        print("Используем сохранённый threshold:", threshold)
 
-        # 4) Превращаем список ошибок обратно в DataFrame для объединения
-        # Создадим вспомогательный DF: каждая строка: (log_text, reconstruction_error)
-        error_tuples = list(zip(log_rows, errors))  # [(text, err), ...]
-        error_df = self.spark.createDataFrame(error_tuples, ["log_text", "recon_error"])
+        # 4) Собираем (Message, recon_error) в Pandas => Spark
+        pdf = pd.DataFrame({"Message": messages, "recon_error": errors})
+        error_df = self.spark.createDataFrame(pdf)
 
-        # 5) Объединим error_df с input_df по "log_text" (упрощённо – JOIN):
-        joined_df = input_df.join(error_df, on="log_text", how="inner")
+        # 5) JOIN по Message
+        joined_df = input_df.join(error_df, on="Message", how="inner")
 
-        # 6) Выбираем строки с аномалиями
+        # 6) Фильтруем аномалии
         anomalies_df = joined_df.filter(col("recon_error") > threshold)
+
         anomalies_df.show(20, False)
 
-        # 7) Создаём папку, если нужно
+        # 7) Создаём папку, если надо
         self.ensure_folder_exists("result-anomaly-logs/")
 
-        # 8) Сохраняем результат
+        # 8) Сохраняем аномалии
         anomalies_df.write.mode("append").parquet(result_path)
         print(f"Результаты сохранены в: {result_path}")
 
-        # 9) Удаляем обработанные файлы
+        # 9) Удаляем исходные файлы из uploads/
         self.delete_processed_files(prefix="uploads/")
 
     def ensure_folder_exists(self, folder_key: str):
         """
         Аналог создания "виртуальной папки" в MinIO (S3).
         """
-        # Проверяем, есть ли объект с таким префиксом
         resp = self.s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=folder_key)
         if 'Contents' not in resp:
-            # Создаём пустой объект
             self.s3_client.put_object(Bucket=self.bucket_name, Key=folder_key, Body=b'')
             print(f"Создана виртуальная папка: {folder_key}")
 

@@ -60,15 +60,15 @@ services:
     depends_on:
       - airflow-setup
 
-  spark-processing-service:
-    build: .
-    container_name: spark-processing-service
-    ports:
-      - "5000:5000"
-    depends_on:
-      - airflow-setup
-    environment:
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    restart: always
+#  spark-processing-service:
+#    build: .
+#    container_name: spark-processing-service
+#    ports:
+#      - "5000:5000"
+#    depends_on:
+#      - airflow-setup
+#    environment:
+#      MINIO_ENDPOINT: http://minio:9000
+#      MINIO_ACCESS_KEY: minioadmin
+#      MINIO_SECRET_KEY: minioadmin
+#    restart: always
