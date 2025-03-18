@@ -14,9 +14,9 @@ from ml_model import (
 )
 
 # ==== Конфигурационные пути (адаптируйте под себя) ====
-logDataPath = r"Z:\Diplom\SparkProcessingService\data\partlogdata1.csv"
-modelSaveDir = r"Z:\Diplom\SparkProcessingService\model"
-anomaliesSavePath = r"Z:\Diplom\SparkProcessingService\output\anomaly-logdata"
+logDataPath = r"C:\Users\admin\Desktop\Diplom\SparkProcessingService\data\partlogdata1.csv"
+modelSaveDir = r"C:\Users\admin\Desktop\Diplom\SparkProcessingService\model"
+anomaliesSavePath = r"C:\Users\admin\Desktop\Diplom\SparkProcessingService\output\anomaly-logdata"
 
 # ==== Инициализация SparkSession ====
 spark = SparkSession.builder \
@@ -26,8 +26,25 @@ spark = SparkSession.builder \
     .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
     .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
     .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.network.timeout", "36000s") \
+    .config("spark.executor.heartbeatInterval", "3600s") \
+    .config("spark.driver.bindAddress", "127.0.0.1") \
+    .config("spark.driver.host", "127.0.0.1") \
+    .config("spark.python.worker.reuse", "false") \
+    .config("spark.local.ip", "127.0.0.1") \
+    .config("spark.driver.extraJavaOptions",
+            "--add-opens=java.base/java.nio=ALL-UNNAMED " +
+            "--add-exports=java.base/java.nio=ALL-UNNAMED " +
+            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED " +
+            "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED") \
+    .config("spark.executor.extraJavaOptions",
+            "--add-opens=java.base/java.nio=ALL-UNNAMED " +
+            "--add-exports=java.base/java.nio=ALL-UNNAMED " +
+            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED " +
+            "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED") \
     .getOrCreate()
 
+print(spark.version)
 # ==== Чтение CSV ====
 logs = spark.read \
     .option("header", "true") \
